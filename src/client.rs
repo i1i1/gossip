@@ -1,12 +1,12 @@
 use displaydoc::Display;
 use serde::{de, ser, Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{error, info, instrument};
+use tracing::{error, info};
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpSocket, TcpStream};
 use tokio::select;
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::RwLock;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -195,18 +195,29 @@ impl ClientShared {
         Ok(())
     }
 
-    #[instrument(skip(self, stream))]
+    const HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(1);
+
+    async fn health_check(&self, id: ClientId) -> Result<()> {
+        loop {
+            tokio::time::sleep(Self::HEALTHCHECK_TIMEOUT).await;
+
+            if let Some(ch) = self.connected.write().await.get(&id) {
+                ch.send(Event::HealthCheck)?;
+            } else {
+                return Ok(());
+            }
+        }
+    }
+
     async fn main_loop(
         &self,
         id: ClientId,
         mut stream: TcpStream,
+        mut recv: UnboundedReceiver<Event>,
     ) -> Result<()> {
         async fn recieve_tcp(stream: &mut TcpStream) -> Result<Event> {
             recieve(stream).await
         }
-
-        let (send_events, mut recv) = mpsc::unbounded_channel();
-        self.connected.write().await.insert(id, send_events);
 
         let default_count = 5u32;
         let mut count = default_count;
@@ -287,7 +298,16 @@ impl Client {
                     {
                         error!(?error);
                     }
-                    shared.main_loop(id, stream).await
+
+                    let (send_events, recv) = mpsc::unbounded_channel();
+                    shared.connected.write().await.insert(id, send_events);
+
+                    let shared_clonned = Arc::clone(&shared);
+                    tokio::spawn(async move {
+                        shared_clonned.health_check(id).await
+                    });
+
+                    shared.main_loop(id, stream, recv).await
                 };
                 tokio::spawn(fut);
             }
@@ -319,8 +339,13 @@ impl Client {
             id
         };
 
+        let (send_events, recv) = mpsc::unbounded_channel();
+        self.shared.connected.write().await.insert(id, send_events);
+
         let shared_cloned = Arc::clone(&self.shared);
-        tokio::spawn(async move { shared_cloned.main_loop(id, stream).await });
+        tokio::spawn(
+            async move { shared_cloned.main_loop(id, stream, recv).await },
+        );
 
         Ok(())
     }

@@ -1,5 +1,4 @@
 use structopt::StructOpt;
-use tracing::info;
 
 use std::net::SocketAddr;
 use std::time::Duration;
